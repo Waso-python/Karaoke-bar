@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, String, Boolean, create_engine, BigInteger
+from sqlalchemy import Column, Integer, String, Boolean, create_engine, BigInteger, DateTime, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 import os
+from datetime import datetime
 
 Base = declarative_base()
 
@@ -20,12 +21,45 @@ class User(Base):
     language_code = Column(String, nullable=True)
 
 
-def init_db():
-    # Удаляем старую БД если она существует
-    if os.path.exists("karaoke_bot.db"):
-        os.remove("karaoke_bot.db")
+class Admin(Base):
+    __tablename__ = "admins"
 
-    # Создаем новую БД
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True)
+    username = Column(String, nullable=True)
+
+
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey('users.telegram_id'))
+    song_id = Column(Integer)
+    song_title = Column(String)
+    song_artist = Column(String)
+    has_backing = Column(Boolean)
+    status = Column(String, default="pending")  # pending, completed, cancelled
+    ordered_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Связь с пользователем
+    user = relationship("User", backref="orders")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "song_id": self.song_id,
+            "song_title": self.song_title,
+            "song_artist": self.song_artist,
+            "has_backing": self.has_backing,
+            "status": self.status,
+            "ordered_at": self.ordered_at,
+            "completed_at": self.completed_at
+        }
+
+
+def init_db():
+    # Создаем новую БД, если она еще не существует
     engine = create_engine("sqlite:///karaoke_bot.db")
     Base.metadata.create_all(engine)
     return engine

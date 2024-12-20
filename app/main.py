@@ -1,9 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query
 from typing import List, Optional
 from enum import Enum
-import csv
-import os
 from .models import Song
+from .utils import SONGS
 from difflib import SequenceMatcher
 import itertools
 
@@ -74,44 +73,6 @@ def calculate_relevance_score(song: Song, query_parts: List[str], search_type: S
     return (max_title_score * 0.6) + (max_artist_score * 0.4)
 
 
-def load_songs() -> List[Song]:
-    songs = []
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    songs_file = os.path.join(current_dir, "songs.csv")
-
-    try:
-        with open("songs.csv", 'r', encoding='cp1251') as file:
-            next(file)
-            csv_reader = csv.reader(file, delimiter=';')
-            for row in csv_reader:
-                if len(row) >= 4:
-                    try:
-                        has_backing = bool(row[3].strip()) if len(
-                            row) > 3 else False
-
-                        songs.append(Song(
-                            id=int(row[0]) if row[0].strip() else 0,
-                            title=row[1].strip(),
-                            artist=row[2].strip(),
-                            has_backing=has_backing,
-                            type=row[4].strip() if len(row) > 4 else None
-                        ))
-                    except Exception as e:
-                        print(f"Ошибка при обработке строки {row}: {e}")
-                        continue
-    except FileNotFoundError:
-        print("Файл songs.csv не найден")
-        return []
-    except Exception as e:
-        print(f"Ошибка при чтении файла: {e}")
-        return []
-
-    return songs
-
-
-SONGS = load_songs()
-
-
 @app.get("/songs/", response_model=List[Song])
 async def get_all_songs():
     return SONGS
@@ -142,7 +103,7 @@ async def search_songs(
     results = []
 
     for song in SONGS:
-        # Проверяем фильтр по бэку, если он задан
+        # Проверяем фильтр по бэку, если он за��ан
         if with_backing is not None and song.has_backing != with_backing:
             continue
 
