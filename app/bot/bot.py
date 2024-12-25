@@ -21,7 +21,7 @@ load_dotenv()
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_URL = "http://localhost:8000"
+API_URL = "http://localhost:8009"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 # Статусы заказов
@@ -30,6 +30,13 @@ ORDER_STATUSES = {
     "completed": "✅ Исполнена",
     "cancelled": "❌ Отменена"
 }
+
+def moscow_time(dt: datetime) -> datetime:
+    """Конвертация времени в московское"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    moscow_tz = timezone(timedelta(hours=3))  # UTC+3 для Москвы
+    return dt.astimezone(moscow_tz)
 
 # Настройка логирования
 log_formatter = logging.Formatter(
