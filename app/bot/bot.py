@@ -16,6 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime, timezone, timedelta
 from aiogram import F
 from logging.handlers import RotatingFileHandler
+from functools import wraps
 
 load_dotenv()
 
@@ -30,6 +31,64 @@ ORDER_STATUSES = {
     "completed": "✅ Исполнена",
     "cancelled": "❌ Отменена"
 }
+
+
+async def ensure_registered_user(message: types.Message, state: FSMContext) -> bool:
+    """Проверяет, зарегистрирован ли пользователь, и перенаправляет на регистрацию, если нет"""
+    session = Session()
+    user = session.query(User).filter_by(
+        telegram_id=message.from_user.id).first()
+    session.close()
+
+    if not user or not user.is_registered:
+        await message.reply(
+            "Вы не зарегистрированы. Пожалуйста, используйте команду /start для регистрации."
+        )
+        return False
+    return True
+
+
+def require_registration(handler):
+    @wraps(handler)
+    async def wrapper(event, *args, **kwargs):
+        print("require_registration")
+
+        # Определяем telegram_id в зависимости от типа события
+        if isinstance(event, types.CallbackQuery):
+            telegram_id = event.from_user.id
+            reply_to = event.message.reply
+        else:  # Message
+            telegram_id = event.from_user.id
+            reply_to = event.reply
+
+        session = Session()
+        user = session.query(User).filter_by(telegram_id=telegram_id).first()
+        admin = session.query(Admin).filter_by(telegram_id=telegram_id).first()
+        session.close()
+
+        # Пропускаем проверку, если пользователь является администратором
+        if admin:
+            return await handler(event, *args, **kwargs)
+
+        if not user or not user.is_registered:
+            print("user not registered")
+            await reply_to(
+                "Вы не зарегистрированы. Пожалуйста, используйте команду /start для регистрации."
+            )
+            return
+
+        return await handler(event, *args, **kwargs)
+
+    return wrapper
+
+
+def moscow_time(dt: datetime) -> datetime:
+    """Конвертация времени в московское"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    moscow_tz = timezone(timedelta(hours=3))  # UTC+3 для Москвы
+    return dt.astimezone(moscow_tz)
+
 
 # Настройка логирования
 log_formatter = logging.Formatter(
@@ -176,6 +235,7 @@ def create_search_type_buttons() -> InlineKeyboardMarkup:
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
     """Обработка команды /start"""
+    print("start_command")
     try:
         print(message.from_user.id)
         session = Session()
@@ -189,6 +249,7 @@ async def start_command(message: types.Message, state: FSMContext):
                 "👋 Добро пожаловать в панель администратора!\n\n"
                 "Доступные команды:\n"
                 "/orders - просмотр активных заказов\n"
+                "/completed - просмотр исполненных заказов\n"
                 "/search - поиск песен\n"
                 "/new_admin - добавить нового администратора",
                 parse_mode="HTML"
@@ -232,6 +293,7 @@ async def start_command(message: types.Message, state: FSMContext):
     F.text == "/reset",
     flags={"command_priority": 1}
 )
+@require_registration
 async def reset_command(message: types.Message, state: FSMContext):
     """Сброс регистрации пользователя"""
     print("reset_command")
@@ -306,6 +368,7 @@ async def reset_command(message: types.Message, state: FSMContext):
 @dp.message(Command("new_admin"))
 async def new_admin_command(message: types.Message, state: FSMContext):
     """Обработка команды /new_admin"""
+    print("new_admin_command")
     await message.reply("Пожалуйста, введите пароль администратора:")
     await state.set_state(UserState.waiting_for_admin_password)
 
@@ -313,6 +376,7 @@ async def new_admin_command(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserState.waiting_for_admin_password))
 async def process_admin_password(message: types.Message, state: FSMContext):
     """Обработка ввода пароля администратора"""
+    print("process_admin_password")
     if message.text == ADMIN_PASSWORD:
         try:
             session = Session()
@@ -342,6 +406,7 @@ async def process_admin_password(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserState.waiting_for_name))
 async def process_name(message: types.Message, state: FSMContext):
     """Обработка ввода имени"""
+    print("process_name")
     try:
         session = Session()
         user = session.query(User).filter_by(
@@ -373,13 +438,14 @@ async def process_name(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserState.waiting_for_table))
 async def process_table(message: types.Message, state: FSMContext):
     """Обработка ввода номера столика"""
+    print("process_table")
     try:
         session = Session()
         user = session.query(User).filter_by(
             telegram_id=message.from_user.id).first()
 
         if not user:
-            await message.reply("Пр��изошла ошибка. Пожалуйста, начните сначала с команды /start")
+            await message.reply("Произошла ошибка. Пожалуйста, начните сначала с команды /start")
             return
 
         user.table_number = message.text
@@ -405,6 +471,7 @@ async def process_table(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserState.ready_to_search))
 async def show_search_options(message: types.Message, state: FSMContext):
     """Показ опций поиска"""
+    print("show_search_options")
     await message.reply(
         "Выберите тип поиска:",
         reply_markup=create_search_type_buttons()
@@ -418,11 +485,11 @@ class SearchState(StatesGroup):
 
 
 @dp.callback_query(lambda c: c.data.startswith('search_'))
+@require_registration
 async def process_search_type(callback_query: CallbackQuery, state: FSMContext):
     """Обработка выбора типа поиска"""
-    print("process_search_type", callback_query.data)
     search_type = callback_query.data
-    print("process_search_type", search_type)
+    print(search_type)
 
     if search_type == "search_by_artist":
         await state.set_state(SearchState.waiting_for_artist)
@@ -434,18 +501,23 @@ async def process_search_type(callback_query: CallbackQuery, state: FSMContext):
         await callback_query.message.reply(
             "Введите название песни:"
         )
-    else:  # search_free
+    elif search_type == "search_free":
         await state.set_state(SearchState.waiting_for_free_search)
         await callback_query.message.reply(
             "Введите любой текст для поиска:"
         )
+    else:
+        await callback_query.answer("Неизвестный тип поиска.")
+        return
 
     await callback_query.answer()
 
 
 @dp.message(StateFilter(SearchState.waiting_for_artist))
+@require_registration
 async def process_artist_search(message: types.Message, state: FSMContext):
     """Обработка поиска по исполнителю"""
+    print("process_artist_search")
     try:
         user_id = message.from_user.id
         logger.info(f"User {user_id} searching by artist: {message.text}")
@@ -478,8 +550,10 @@ async def process_artist_search(message: types.Message, state: FSMContext):
 
 
 @dp.message(StateFilter(SearchState.waiting_for_title))
+@require_registration
 async def process_title_search(message: types.Message, state: FSMContext):
     """Обработка поиска по названию песни"""
+    print("process_title_search")
     try:
         user_id = message.from_user.id
         logger.info(f"User {user_id} searching by title: {message.text}")
@@ -512,8 +586,10 @@ async def process_title_search(message: types.Message, state: FSMContext):
 
 
 @dp.message(StateFilter(SearchState.waiting_for_free_search))
+@require_registration
 async def process_free_search(message: types.Message, state: FSMContext):
     """Обработка свободного поиска"""
+    print("process_free_search")
     try:
         user_id = message.from_user.id
         logger.info(f"User {user_id} performing free search: {message.text}")
@@ -539,8 +615,10 @@ async def process_free_search(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query(lambda c: c.data.startswith('song_'))
+@require_registration
 async def process_song_selection(callback_query: CallbackQuery):
     """Обработка выбора песни"""
+    print("process_song_selection")
     try:
         song_id = callback_query.data.split('_')[1]
         await callback_query.message.reply(
@@ -555,8 +633,10 @@ async def process_song_selection(callback_query: CallbackQuery):
 
 
 @dp.callback_query(lambda c: c.data.startswith('order_'))
+@require_registration
 async def process_order(callback_query: CallbackQuery, state: FSMContext):
     """Обработка заказа песни"""
+    print("process_order")
     try:
         song_id = callback_query.data.split('_')[1]
         session = Session()
@@ -626,6 +706,7 @@ async def process_order(callback_query: CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(lambda c: c.data == 'find_another')
+@require_registration
 async def process_find_another(callback_query: CallbackQuery):
     """Обработка нажатия 'Найти другую'"""
     try:
@@ -660,9 +741,124 @@ async def notify_admins(message_text: str):
         session.close()
 
 
+@dp.message(Command("completed"))
+async def list_completed_orders(message: types.Message):
+    """Показать список исполненных заказов за последние 16 часов"""
+    print("list_completed_orders")
+    try:
+        session = Session()
+        admin = session.query(Admin).filter_by(
+            telegram_id=message.from_user.id).first()
+
+        if not admin:
+            await message.reply("❌ Эта команда доступна только администраторам.")
+            return
+
+        # Вычисляем время 16 часов назад
+        time_threshold = datetime.now(timezone.utc) - timedelta(hours=16)
+
+        # Получаем все исполненные и отмененные заказы за последние 16 часов
+        orders = session.query(Order).filter(
+            Order.status.in_(["completed", "cancelled"]),
+            Order.completed_at >= time_threshold
+        ).order_by(Order.completed_at.desc()).all()
+
+        if not orders:
+            await message.reply(
+                "📝 Нет исполненных заказов за последние 16 часов",
+                parse_mode="HTML"
+            )
+            return
+
+        # Группируем заказы по столикам
+        orders_by_table = {}
+        for order in orders:
+            table = order.user.table_number
+            if table not in orders_by_table:
+                orders_by_table[table] = []
+            orders_by_table[table].append(order)
+
+        # Отправляем сводную информацию
+        summary = (
+            "📊 <b>Статистика за последние 16 часов:</b>\n"
+            f"Всего заказов: {len(orders)}\n"
+            f"Исполнено: {len([o for o in orders if o.status == 'completed'])}\n"
+            f"Отменено: {len([o for o in orders if o.status == 'cancelled'])}\n"
+            f"Активных столиков: {len(orders_by_table)}\n\n"
+            "📝 <b>Детальный отчет по столикам:</b>\n"
+        )
+        await message.reply(summary, parse_mode="HTML")
+
+        # Отправляем информацию по каждому столику
+        for table, table_orders in sorted(orders_by_table.items()):
+            # Собираем информацию о пользователях за столиком
+            users = {order.user.display_name for order in table_orders}
+
+            table_info = (
+                f"🎯 <b>Столик {table}</b>\n"
+                f"👥 Клиенты: {', '.join(users)}\n"
+                f"📋 Всего заказов: {len(table_orders)}\n"
+                "┌──────────────────────────────────\n"
+            )
+
+            # Добавляем информацию о каждом заказе
+            for order in table_orders:
+                status_emoji = "✅" if order.status == "completed" else "❌"
+                backing_emoji = "🎵" if order.has_backing else "🎤"
+
+                order_line = (
+                    f"├ {status_emoji} <b>#{order.id}</b> {backing_emoji} "
+                    f"{order.song_artist} - {order.song_title}\n"
+                    f"│  ⏰ {moscow_time(order.ordered_at).strftime('%H:%M')} → "
+                    f"{moscow_time(order.completed_at).strftime('%H:%M')}\n"
+                )
+                table_info += order_line
+
+            table_info += "└──────────────────────────────────\n"
+
+            # Добавляем статистику по столику
+            completed = len(
+                [o for o in table_orders if o.status == "completed"])
+            cancelled = len(
+                [o for o in table_orders if o.status == "cancelled"])
+            table_info += (
+                f"✅ Исполнено: {completed}\n"
+                f"❌ Отменено: {cancelled}\n"
+            )
+
+            await message.reply(table_info, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Error in list_completed_orders: {e}")
+        await message.reply("❌ Произошла ошибка при получении списка исполненных заказов.")
+    finally:
+        session.close()
+
+
+@dp.message(Command("search"))
+async def admin_search_command(message: types.Message, state: FSMContext):
+    """Команда поиска для администраторов"""
+    session = Session()
+    admin = session.query(Admin).filter_by(
+        telegram_id=message.from_user.id).first()
+    session.close()
+
+    if not admin:
+        await message.reply("❌ Эта команда доступна только администраторам.")
+        return
+
+    await message.reply(
+        "Выберите тип поиска:",
+        reply_markup=create_search_type_buttons()
+    )
+    await state.set_state(UserState.ready_to_search)
+
+
 @dp.message(Command("orders"))
+@require_registration
 async def list_orders(message: types.Message):
     """Показать список активных заказов"""
+    print("list_orders")
     try:
         session = Session()
         admin = session.query(Admin).filter_by(
@@ -693,7 +889,7 @@ async def list_orders(message: types.Message):
                 f"• Имя: {user.display_name}\n"
                 f"• Столик: {user.table_number}\n"
                 f"• Username: @{user.username}\n"
-                f"⏰ Заказано: {moscow_time(order.ordered_at).strftime('%H:%M:%S')}\n"
+                f"• Заказано: {moscow_time(order.ordered_at).strftime('%H:%M:%S')}\n"
                 f"• Статус: {ORDER_STATUSES[order.status]}\n\n"
                 f"Действия: /complete_{order.id} | /cancel_{order.id}"
             )
@@ -709,6 +905,7 @@ async def list_orders(message: types.Message):
 @dp.message(lambda message: message.text and message.text.startswith(("/complete_", "/cancel_")))
 async def handle_order_action(message: types.Message):
     """Обработка действий с заказами"""
+    print("handle_order_action")
     try:
         session = Session()
         admin = session.query(Admin).filter_by(
@@ -752,9 +949,79 @@ async def handle_order_action(message: types.Message):
         session.close()
 
 
+@dp.callback_query(lambda c: c.data.startswith('page_'))
+async def process_pagination(callback_query: CallbackQuery, state: FSMContext):
+    """Обработка навигации по страницам"""
+    print("process_pagination")
+    try:
+        page = int(callback_query.data.split('_')[1])
+
+        # Получаем сохраненные результаты поиска
+        data = await state.get_data()
+        songs = data.get('search_results')
+
+        if not songs:
+            await callback_query.answer("Результаты поиска устарели. Выполните новый поис.")
+            return
+
+        keyboard = create_song_buttons(songs, page)
+
+        await callback_query.message.edit_reply_markup(
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+
+    except Exception as e:
+        logger.error(f"Error in process_pagination: {e}")
+        await callback_query.answer("Произошла ошибка при навигации.")
+
+
+@dp.callback_query(lambda c: c.data == 'ignore')
+async def process_ignore(callback_query: CallbackQuery):
+    """Обработка нажатия на счетчик страниц"""
+    print("process_ignore")
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "exit_search")
+async def process_exit_search(callback_query: CallbackQuery, state: FSMContext):
+    """Обработка выхода из поиска"""
+    print("process_exit_search")
+    try:
+        session = Session()
+        admin = session.query(Admin).filter_by(
+            telegram_id=callback_query.from_user.id).first()
+
+        if admin:
+            await callback_query.message.edit_text(
+                "Поиск завершен.\n\n"
+                "Доступные команды:\n"
+                "/orders - просмотр активных заказов\n"
+                "/completed - просмотр исполненных заказов\n"
+                "/search - поиск песен\n"
+                "/new_admin - добавить нового администратора"
+            )
+        else:
+            await callback_query.message.edit_text(
+                "Поиск завершен. Выберите тип поиска:",
+                reply_markup=create_search_type_buttons()
+            )
+            await state.set_state(UserState.ready_to_search)
+
+        await state.clear()
+        await callback_query.answer()
+
+    except Exception as e:
+        logger.error(f"Error in process_exit_search: {e}")
+        await callback_query.answer("Произошла ошибка при выходе из поиска.")
+    finally:
+        session.close()
+
+
 @dp.message()
 async def handle_unknown_message(message: types.Message, state: FSMContext):
     """Обработка всех необработанных сообщений"""
+    print("handle_unknown_message")
     try:
         session = Session()
 
@@ -766,6 +1033,7 @@ async def handle_unknown_message(message: types.Message, state: FSMContext):
             await message.reply(
                 "Доступные команды:\n"
                 "/orders - просмотр активных заказов\n"
+                "/completed - просмотр исполненных заказов\n"
                 "/search - поиск песен\n"
                 "/new_admin - добавить нового администратора"
             )
@@ -813,144 +1081,6 @@ async def handle_unknown_message(message: types.Message, state: FSMContext):
         session.close()
 
 
-@dp.callback_query(lambda c: c.data.startswith('page_'))
-async def process_pagination(callback_query: CallbackQuery, state: FSMContext):
-    """Обработка навигации по страницам"""
-    try:
-        page = int(callback_query.data.split('_')[1])
-
-        # Получаем сохраненные результаты поиска
-        data = await state.get_data()
-        songs = data.get('search_results')
-
-        if not songs:
-            await callback_query.answer("Результаты поиска устарели. Выполните новый поиск.")
-            return
-
-        keyboard = create_song_buttons(songs, page)
-
-        await callback_query.message.edit_reply_markup(
-            reply_markup=keyboard
-        )
-        await callback_query.answer()
-
-    except Exception as e:
-        logger.error(f"Error in process_pagination: {e}")
-        await callback_query.answer("Произошла ошибка при навигации.")
-
-
-@dp.callback_query(lambda c: c.data == 'ignore')
-async def process_ignore(callback_query: CallbackQuery):
-    """Обработка нажатия на счетчик страниц"""
-    await callback_query.answer()
-
-
-@dp.message(Command("search"))
-async def admin_search_command(message: types.Message, state: FSMContext):
-    """Команда поиска для администраторов"""
-    try:
-        session = Session()
-        admin = session.query(Admin).filter_by(
-            telegram_id=message.from_user.id).first()
-
-        if not admin:
-            await message.reply("❌ Эта команда доступна только администраторам.")
-            return
-
-        await message.reply(
-            "Выберите тип поиска:",
-            reply_markup=create_search_type_buttons()
-        )
-        await state.set_state(UserState.ready_to_search)
-
-    except Exception as e:
-        logger.error(f"Error in admin_search_command: {e}")
-        await message.reply("Произошла ошибка. Пожалуйста, попробуйте позже.")
-    finally:
-        session.close()
-
-
-@dp.callback_query(lambda c: c.data == "exit_search")
-async def process_exit_search(callback_query: CallbackQuery, state: FSMContext):
-    """Обработка выхода из поиска"""
-    try:
-        session = Session()
-        admin = session.query(Admin).filter_by(
-            telegram_id=callback_query.from_user.id).first()
-
-        if admin:
-            await callback_query.message.edit_text(
-                "Поиск завершен.\n\n"
-                "Доступные команды:\n"
-                "/orders - просмотр активных заказов\n"
-                "/search - поиск песен\n"
-                "/new_admin - добавить нового администратора"
-                "/completed_orders - просмотр исполненных заявок за последние 16 часов"
-            )
-        else:
-            await callback_query.message.edit_text(
-                "Поиск завершен. Выберите тип поиска:",
-                reply_markup=create_search_type_buttons()
-            )
-            await state.set_state(UserState.ready_to_search)
-
-        await state.clear()
-        await callback_query.answer()
-
-    except Exception as e:
-        logger.error(f"Error in process_exit_search: {e}")
-        await callback_query.answer("Произошла ошибка при выходе из поиска.")
-    finally:
-        session.close()
-
-
-@dp.message(Command("completed_orders"))
-async def completed_orders_command(message: types.Message):
-    """Просмотр списка исполненных заявок за последние 16 часов"""
-    try:
-        session = Session()
-        admin = session.query(Admin).filter_by(
-            telegram_id=message.from_user.id).first()
-
-        if not admin:
-            await message.reply("❌ Эта команда доступна только администраторам.")
-            return
-
-        # Вычисляем время 16 часов назад
-        time_threshold = datetime.now(timezone.utc) - timedelta(hours=16)
-
-        # Извлекаем выполненные заказы за последние 16 часов
-        completed_orders = session.query(Order).filter(
-            Order.status == "completed",
-            Order.completed_at >= time_threshold
-        ).all()
-
-        if not completed_orders:
-            await message.reply("📝 Исполненных заявок за последние 16 часов нет.")
-            return
-
-        # Формируем сообщение с информацией о выполненных заказах
-        response = "✅ Исполненные заявки за последние 16 часов:\n\n"
-        for order in completed_orders:
-            response += (
-                f"🎼 Песня: {order.song_title}\n"
-                f"👨‍🎤 Исполнитель: {order.song_artist}\n"
-                f"🕒 Время выполнения: {moscow_time(order.completed_at).strftime('%H:%M:%S')}\n"
-                f"👤 Клиент: {order.user.display_name} (Столик: {order.user.table_number})\n\n"
-            )
-
-        await message.reply(response, parse_mode="HTML")
-
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in completed_orders_command: {e}")
-        await message.reply("❌ Произошла ошибка при получении списка заявок.")
-    except Exception as e:
-        logger.error(f"Error in completed_orders_command: {e}")
-        await message.reply("❌ Произошла ошибка. Пожалуйста, попробуйте позже.")
-    finally:
-        session.close()
-
-
 async def run_bot():
     """Зпуск бота"""
     try:
@@ -961,7 +1091,6 @@ async def run_bot():
     finally:
         if bot.session:
             await bot.session.close()
-
 
 if __name__ == "__main__":
     import asyncio
