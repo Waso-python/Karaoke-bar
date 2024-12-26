@@ -22,7 +22,7 @@ load_dotenv()
 
 # Конфигурация
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_URL = "http://localhost:8000"
+API_URL = "http://localhost:8009"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 # Статусы заказов
@@ -45,6 +45,46 @@ async def ensure_registered_user(message: types.Message, state: FSMContext) -> b
             "Вы не зарегистрированы. Пожалуйста, используйте команду /start для регистрации."
         )
         return False
+    return True
+
+
+async def check_registration_expiry(user: User, message: types.Message, state: FSMContext) -> bool:
+    """Проверяет, не истек ли срок регистрации пользователя"""
+    if not user.registered_at:
+        return True
+
+    # Убедимся, что registered_at имеет часовой пояс
+    if user.registered_at.tzinfo is None:
+        registered_at = user.registered_at.replace(tzinfo=timezone.utc)
+    else:
+        registered_at = user.registered_at
+
+    expiry_time = registered_at + timedelta(hours=16)
+    current_time = datetime.now(timezone.utc)
+
+    if current_time > expiry_time:
+        # Сбрасываем регистрацию
+        session = Session()
+        try:
+            user = session.query(User).filter_by(
+                telegram_id=user.telegram_id).first()
+            user.is_registered = False
+            user.display_name = None
+            user.table_number = None
+            user.registered_at = None
+            session.commit()
+
+            await state.clear()
+            await message.reply(
+                "⏰ Срок вашей регистрации истек.\n"
+                "Пожалуйста, используйте команду /start для повторной регистрации."
+            )
+            return False
+        except Exception as e:
+            logger.error(f"Error in check_registration_expiry: {e}")
+        finally:
+            session.close()
+
     return True
 
 
@@ -75,6 +115,10 @@ def require_registration(handler):
             await reply_to(
                 "Вы не зарегистрированы. Пожалуйста, используйте команду /start для регистрации."
             )
+            return
+
+        # Проверяем срок регистрации
+        if not await check_registration_expiry(user, event if isinstance(event, types.Message) else event.message, kwargs.get('state')):
             return
 
         return await handler(event, *args, **kwargs)
@@ -232,6 +276,17 @@ def create_search_type_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+def create_reorder_button(song_id: int) -> InlineKeyboardMarkup:
+    """Создание кнопки для повторного заказа песни"""
+    keyboard = [
+        [InlineKeyboardButton(
+            text="🔄 Заказать снова",
+            callback_data=f"order_{song_id}"
+        )]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
 @dp.message(Command("start"))
 async def start_command(message: types.Message, state: FSMContext):
     """Обработка команды /start"""
@@ -287,6 +342,71 @@ async def start_command(message: types.Message, state: FSMContext):
     finally:
         session.close()
 
+
+@dp.message(Command("history"))
+@require_registration
+async def show_user_history(message: types.Message):
+    """Показать последние 10 уникальных исполненных заказов пользователя"""
+    print("show_user_history")
+    try:
+        session = Session()
+        # Получаем все исполненные заказы пользователя
+        orders = session.query(Order).filter_by(
+            user_id=message.from_user.id,
+            status="completed"
+        ).order_by(
+            Order.ordered_at.desc()
+        ).all()
+
+        if not orders:
+            await message.reply(
+                "📝 У вас пока нет исполненных заказов.\n"
+                "Используйте команду /search для поиска и заказа песен."
+            )
+            return
+
+        # Создаем словарь для хранения уникальных песен
+        unique_songs = {}
+        for order in orders:
+            song_key = f"{order.song_artist}:{order.song_title}"
+            if song_key not in unique_songs:
+                unique_songs[song_key] = order
+
+        # Берем только 10 последних уникальных песен
+        unique_orders = list(unique_songs.values())[:10]
+
+        # Отправляем заголовок
+        await message.reply(
+            "📋 <b>Ваши последние исполненные песни:</b>",
+            parse_mode="HTML"
+        )
+
+        # Отправляем каждую песню отдельным сообщением
+        for order in unique_orders:
+            backing_emoji = "🎵" if order.has_backing else "🎤"
+            song_info = (
+                f"{backing_emoji} <b>Песня #{order.song_id}</b>\n"
+                f"👨‍🎤 <b>Исполнитель:</b> {order.song_artist}\n"
+                f"🎵 <b>Название:</b> {order.song_title}\n"
+                f"🎹 <b>Тип:</b> {'С бэк-треком' if order.has_backing else 'Без бэк-трека'}"
+            )
+            
+            # Создаем кнопку для повторного заказа
+            keyboard = create_reorder_button(order.song_id)
+            
+            await message.reply(
+                song_info,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+
+    except Exception as e:
+        logger.error(f"Error in show_user_history: {e}")
+        await message.reply(
+            "❌ Произошла ошибка при получении истории заказов."
+        )
+    finally:
+        session.close()
 
 @dp.message(
     Command("reset"),
@@ -438,32 +558,37 @@ async def process_name(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(UserState.waiting_for_table))
 async def process_table(message: types.Message, state: FSMContext):
     """Обработка ввода номера столика"""
-    print("process_table")
     try:
         session = Session()
         user = session.query(User).filter_by(
             telegram_id=message.from_user.id).first()
 
-        if not user:
-            await message.reply("Произошла ошибка. Пожалуйста, начните сначала с команды /start")
-            return
+        if user:
+            user.table_number = message.text
+            user.is_registered = True
+            # Устанавливаем время регистрации с явным указанием UTC
+            user.registered_at = datetime.now(timezone.utc)
+            session.commit()
 
-        user.table_number = message.text
-        session.commit()
-
-        await message.reply(
-            f"Отлично! Ваш столик: {message.text}\n"
-            "Выберите тип поиска:",
-            reply_markup=create_search_type_buttons()
-        )
-        await state.set_state(UserState.ready_to_search)
+            await message.reply(
+                f"Отлично! Ваш столик: {message.text}\n\n"
+                "Доступные команды:\n"
+                "/search - поиск и заказ песен\n"
+                "/history - ваши последние заказы\n"
+                "/reset - сброс регистрации\n\n"
+                "Выберите тип поиска:",
+                reply_markup=create_search_type_buttons()
+            )
+            await state.set_state(UserState.ready_to_search)
+        else:
+            await message.reply(
+                "Произошла ошибка. Пож��луйста, начните регистрацию заново с команды /start"
+            )
+            await state.clear()
 
     except SQLAlchemyError as e:
         logger.error(f"Database error in process_table: {e}")
         await message.reply("Произошла ошибка при сохранении данных. Пожалуйста, попробуйте еще раз.")
-    except Exception as e:
-        logger.error(f"Error in process_table: {e}")
-        await message.reply("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
     finally:
         session.close()
 
@@ -482,6 +607,26 @@ class SearchState(StatesGroup):
     waiting_for_artist = State()
     waiting_for_title = State()
     waiting_for_free_search = State()
+
+
+def get_name_variations(name: str) -> list[str]:
+    """Создает варианты написания имени исполнителя"""
+    name = name.lower().strip()
+    parts = name.split()
+    variations = [name]  # оригинальное написание
+
+    # Если имя состоит из нескольких частей
+    if len(parts) > 1:
+        # Добавляем вариант с обратным порядком слов
+        variations.append(' '.join(reversed(parts)))
+
+        # Если частей больше двух, пробуем разные комбинации
+        if len(parts) > 2:
+            for i in range(len(parts)):
+                rotated = parts[i:] + parts[:i]
+                variations.append(' '.join(rotated))
+
+    return list(set(variations))  # убираем дубликаты
 
 
 @dp.callback_query(lambda c: c.data.startswith('search_'))
@@ -517,33 +662,45 @@ async def process_search_type(callback_query: CallbackQuery, state: FSMContext):
 @require_registration
 async def process_artist_search(message: types.Message, state: FSMContext):
     """Обработка поиска по исполнителю"""
-    print("process_artist_search")
     try:
-        user_id = message.from_user.id
-        logger.info(f"User {user_id} searching by artist: {message.text}")
+        # Получаем все возможные варианты написания имени
+        name_variations = get_name_variations(message.text)
+        all_results = []
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{API_URL}/songs/by-artist/?artist={message.text}"
-            ) as response:
-                if response.status == 200:
-                    songs = await response.json()
-                    if not songs:
-                        await message.reply(
-                            "Исполнитель не найден. Попробуйте другой запрос или выберите другой тип поиска:",
-                            reply_markup=create_search_type_buttons()
-                        )
-                        return
+            # Проверяем каждый вариант написания
+            for name_variant in name_variations:
+                async with session.get(
+                    f"{API_URL}/songs/by-artist/?artist={name_variant}"
+                ) as response:
+                    if response.status == 200:
+                        songs = await response.json()
+                        all_results.extend(songs)
 
-                    await state.update_data(search_results=songs)
-                    keyboard = create_song_buttons(songs, page=0)
-                    await message.reply(
-                        f"Найдено песен исполнителя: {len(songs)}\n"
-                        "Выберите песню из списка:",
-                        reply_markup=keyboard
-                    )
-                else:
-                    await message.reply("Произошла ошибка при поиске.")
+        # Убираем дубликаты по ID песни
+        unique_results = {song['id']: song for song in all_results}.values()
+        songs = list(unique_results)
+
+        if not songs:
+            await message.reply(
+                "Исполнитель не найден. Попробуйте другой запрос или выберите другой тип поиска:",
+                reply_markup=create_search_type_buttons()
+            )
+            return
+
+        # Логируем успешный поиск
+        logger.info(
+            f"User {message.from_user.id} searched artist: {message.text}. "
+            f"Variations tried: {name_variations}. Found: {len(songs)} songs"
+        )
+
+        await state.update_data(search_results=songs)
+        keyboard = create_song_buttons(songs, page=0)
+        await message.reply(
+            f"Найдено песен исполнителя: {len(songs)}\n"
+            "Выберите песню из списка:",
+            reply_markup=keyboard
+        )
     except Exception as e:
         logger.error(f"Error in process_artist_search: {e}")
         await message.reply("Произошла ошибка при поиске.")
@@ -636,7 +793,6 @@ async def process_song_selection(callback_query: CallbackQuery):
 @require_registration
 async def process_order(callback_query: CallbackQuery, state: FSMContext):
     """Обработка заказа песни"""
-    print("process_order")
     try:
         song_id = callback_query.data.split('_')[1]
         session = Session()
@@ -660,7 +816,7 @@ async def process_order(callback_query: CallbackQuery, state: FSMContext):
 
             backing_status = "🎵 С бэк-треком" if song.has_backing else "🎤 Без бэк-трека"
             order_info = (
-                f"🎵 <b>Новый заказ песни! (ID: {order.id})</b>\n\n"
+                f"<b>Новый заказ песни! (ID: {order.id})</b>\n\n"
                 f"🎼 <b>Песня:</b> {song.title}\n"
                 f"👨‍🎤 <b>Исполнитель:</b> {song.artist}\n"
                 f"ℹ️ <b>ID песни:</b> {song_id}\n"
@@ -673,10 +829,9 @@ async def process_order(callback_query: CallbackQuery, state: FSMContext):
                 f"• Заказано: {moscow_time(order.ordered_at).strftime('%H:%M:%S')}\n"
                 f"• Статус: {ORDER_STATUSES[order.status]}"
             )
-            await notify_admins(order_info)
 
-            # Очищаем состояние перед отправкой нового сообщения
-            await state.clear()
+            # Передаем ID заказа в функцию уведомления
+            await notify_admins(order_info, order.id)
 
             await callback_query.message.reply(
                 "✅ Ваш заказ отправлен!\n\n"
@@ -685,7 +840,6 @@ async def process_order(callback_query: CallbackQuery, state: FSMContext):
                 parse_mode="HTML"
             )
 
-            # Устанавливаем состояние ready_to_search после отправки сообщения
             await state.set_state(UserState.ready_to_search)
 
         else:
@@ -720,23 +874,26 @@ async def process_find_another(callback_query: CallbackQuery):
         await callback_query.message.reply("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
 
 
-async def notify_admins(message_text: str):
-    """Отправка сообщения всем администраторам"""
+async def notify_admins(order_info: str, order_id: int):
+    """Отправка уведомления администраторам о новом заказе"""
+    session = Session()
     try:
-        session = Session()
         admins = session.query(Admin).all()
         for admin in admins:
-            try:
-                await bot.send_message(
-                    admin.telegram_id,
-                    message_text,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error sending message to admin {admin.telegram_id}: {e}")
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in notify_admins: {e}")
+            # Добавляем команды управления в конец сообщения
+            full_message = (
+                f"{order_info}\n\n"
+                f"Действия с заказом:\n"
+                f"/complete_{order_id} - отметить как исполненный\n"
+                f"/cancel_{order_id} - отменить заказ"
+            )
+            await bot.send_message(
+                admin.telegram_id,
+                full_message,
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Error in notify_admins: {e}")
     finally:
         session.close()
 
@@ -808,7 +965,7 @@ async def list_completed_orders(message: types.Message):
 
                 order_line = (
                     f"├ {status_emoji} <b>#{order.id}</b> {backing_emoji} "
-                    f"{order.song_artist} - {order.song_title}\n"
+                    f"{order.song_artist} - {order.song_title}({order.song_id})\n"
                     f"│  ⏰ {moscow_time(order.ordered_at).strftime('%H:%M')} → "
                     f"{moscow_time(order.completed_at).strftime('%H:%M')}\n"
                 )
@@ -902,10 +1059,10 @@ async def list_orders(message: types.Message):
         session.close()
 
 
-@dp.message(lambda message: message.text and message.text.startswith(("/complete_", "/cancel_")))
+@dp.message(lambda message: message.text and message.text.startswith(('/complete_', '/cancel_')))
+@dp.message(Command("orders", "completed"))
 async def handle_order_action(message: types.Message):
     """Обработка действий с заказами"""
-    print("handle_order_action")
     try:
         session = Session()
         admin = session.query(Admin).filter_by(
@@ -915,36 +1072,96 @@ async def handle_order_action(message: types.Message):
             await message.reply("❌ Эта команда доступна только администраторам.")
             return
 
-        action, order_id = message.text.split("_")
-        order = session.query(Order).filter_by(id=int(order_id)).first()
+        # ��бработка команд complete_ и cancel_
+        if message.text.startswith(('/complete_', '/cancel_')):
+            try:
+                action, order_id = message.text.split('_')
+                order_id = int(order_id)
+                order = session.query(Order).filter_by(id=order_id).first()
 
-        if not order:
-            await message.reply("❌ Заказ не найден.")
-            return
+                if not order:
+                    await message.reply(f"❌ Заказ #{order_id} не найден.")
+                    return
 
-        if action == "/complete":
-            order.status = "completed"
-            order.completed_at = datetime.now(timezone.utc)
-            status_text = ORDER_STATUSES["completed"]
-        else:
-            order.status = "cancelled"
-            order.completed_at = datetime.now(timezone.utc)
-            status_text = ORDER_STATUSES["cancelled"]
+                # Проверяем, не обработан ли уже заказ
+                if order.status != "pending":
+                    await message.reply(
+                        f"❌ Заказ #{order_id} уже обработан.\n"
+                        f"Текущий статус: {ORDER_STATUSES[order.status]}"
+                    )
+                    return
 
-        session.commit()
+                # Обновляем статус заказа
+                order.status = "completed" if action == "/complete" else "cancelled"
+                order.completed_at = datetime.now(timezone.utc)
+                session.commit()
 
-        # Уведомляем пользователя о статусе заказа
-        user_notification = (
-            f"{status_text}!\n"
-            f"Песня: {order.song_title} - {order.song_artist}\n"
-            f"Время: {moscow_time(order.completed_at).strftime('%H:%M:%S')}"
-        )
-        await bot.send_message(order.user_id, user_notification, parse_mode="HTML")
-        await message.reply(f"{status_text} (ID: {order.id})")
+                # Отправляем подтверждение администратору
+                status_text = "✅ исполнен" if action == "/complete" else "❌ отменен"
+                await message.reply(f"Заказ #{order_id} {status_text}.")
+
+                # Отправляем уведомление клиенту
+                user_notification = (
+                    f"🎵 <b>Обновление статуса заказа #{order.id}</b>\n\n"
+                    f"Песня: {order.song_title}\n"
+                    f"Исполнитель: {order.song_artist}\n"
+                    f"Статус: {ORDER_STATUSES[order.status]}\n"
+                    f"Время: {moscow_time(order.completed_at).strftime('%H:%M:%S')}"
+                    "\n"
+                )
+                user_notification += "Вы прекрасно поёте" if order.status == "completed" else "Жаль, что мы не услышим ваше прекрасное пение"
+                try:
+                    await bot.send_message(
+                        order.user_id,
+                        user_notification,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error sending notification to user {order.user_id}: {e}")
+                    await message.reply(
+                        "⚠️ Заказ обработан, но не удалось отправить уведомление клиенту."
+                    )
+
+            except ValueError:
+                await message.reply("❌ Неверный формат команды.")
+                return
+
+        # Обработка команды /orders
+        elif message.text == "/orders":
+            # Получаем только активные (pending) заказы
+            orders = session.query(Order).filter_by(
+                status="pending"
+            ).order_by(Order.ordered_at.desc()).all()
+
+            if not orders:
+                await message.reply("📝 Нет активных заказов.")
+                return
+
+            await message.reply(
+                "📋 <b>Список активных заказов:</b>",
+                parse_mode="HTML"
+            )
+
+            # Отправляем информацию о каждом заказе
+            for order in orders:
+                user = order.user
+                order_info = (
+                    f"🎵 <b>Заказ #{order.id}</b>\n"
+                    f"🎼 <b>Песня:</b> {order.song_title}\n"
+                    f"👨‍🎤 <b>Исполнитель:</b> {order.song_artist}\n"
+                    f"🎹 <b>Тип:</b> {'🎵 С бэк-треком' if order.has_backing else '🎤 Без бэк-трека'}\n"
+                    f"👤 <b>Клиент:</b> {user.display_name} (Столик: {user.table_number})\n"
+                    f"⏰ <b>Заказано:</b> {moscow_time(order.ordered_at).strftime('%H:%M:%S')}\n\n"
+                    f"Действия:\n"
+                    f"/complete_{order.id} - отметить как исполненный\n"
+                    f"/cancel_{order.id} - отменить заказ"
+                )
+                await message.reply(order_info, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Error in handle_order_action: {e}")
-        await message.reply("❌ Произошла ошибка при обработке действия.")
+        await message.reply("❌ Произошла ошибка при обработке команды.")
     finally:
         session.close()
 
@@ -1066,7 +1283,7 @@ async def handle_unknown_message(message: types.Message, state: FSMContext):
             else:
                 await message.reply(
                     f"Здравствуйте, {user.display_name}! Ваш столик: {user.table_number}\n"
-                    "Выберите тип поиска:\n\n"
+                    "Выберите тип по��ска:\n\n"
                     "💡 Используйте /reset для сброса регистрации",
                     reply_markup=create_search_type_buttons()
                 )
@@ -1091,6 +1308,8 @@ async def run_bot():
     finally:
         if bot.session:
             await bot.session.close()
+
+
 
 if __name__ == "__main__":
     import asyncio

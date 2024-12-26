@@ -19,6 +19,7 @@ class User(Base):
     table_number = Column(String, nullable=True)
     is_registered = Column(Boolean, default=False)
     language_code = Column(String, nullable=True)
+    registered_at = Column(DateTime, nullable=True)
 
 
 class Admin(Base):
