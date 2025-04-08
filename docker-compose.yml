@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  karaoke:
+    build: .
+    container_name: karaoke-app
+    ports:
+      - "8009:8009"
+    volumes:
+      - ./songs.csv:/app/songs.csv
+      - ./karaoke_bot.db:/app/karaoke_bot.db
+      - ./user_searches.log:/app/user_searches.log
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    restart: unless-stopped
