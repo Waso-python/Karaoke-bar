@@ -137,7 +137,10 @@ def moscow_time(dt: datetime) -> datetime:
 # Настройка логирования
 log_formatter = logging.Formatter(
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-log_file = "user_searches.log"
+log_file = "logs/user_searches.log"
+
+# Создаем директорию для логов, если она не существует
+os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
 file_handler = RotatingFileHandler(
     log_file, maxBytes=5*1024*1024, backupCount=2)
@@ -582,7 +585,7 @@ async def process_table(message: types.Message, state: FSMContext):
             await state.set_state(UserState.ready_to_search)
         else:
             await message.reply(
-                "Произошла ошибка. Пож��луйста, начните регистрацию заново с команды /start"
+                "Произошла ошибка. Пожалуйста, начните регистрацию заново с команды /start"
             )
             await state.clear()
 
@@ -1072,7 +1075,7 @@ async def handle_order_action(message: types.Message):
             await message.reply("❌ Эта команда доступна только администраторам.")
             return
 
-        # ��бработка команд complete_ и cancel_
+        # Обработка команд complete_ и cancel_
         if message.text.startswith(('/complete_', '/cancel_')):
             try:
                 action, order_id = message.text.split('_')
@@ -1283,7 +1286,7 @@ async def handle_unknown_message(message: types.Message, state: FSMContext):
             else:
                 await message.reply(
                     f"Здравствуйте, {user.display_name}! Ваш столик: {user.table_number}\n"
-                    "Выберите тип по��ска:\n\n"
+                    "Выберите тип поиска:\n\n"
                     "💡 Используйте /reset для сброса регистрации",
                     reply_markup=create_search_type_buttons()
                 )
